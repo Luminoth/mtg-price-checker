@@ -176,11 +176,26 @@ def generate_recommendation(current_price: Optional[float],
     if current_price is None:
         return "UNKNOWN"
 
+    # Check for strict downward trend (Current < Prev < PrevPrev)
+    valid_history_prices: List[float] = [h[0] for h in history if h[0] is not None]
+
+    if valid_history_prices:
+        # If the latest history entry is the same as the current price (e.g., already saved today),
+        # skip it so we compare against the *previous* day's price.
+        comp_idx = 0
+        if abs(valid_history_prices[0] - current_price) < 0.001:
+            comp_idx = 1
+
+        # We need at least 2 MORE points to compare against
+        if len(valid_history_prices) >= comp_idx + 2:
+            last_db_price = valid_history_prices[comp_idx]
+            prev_db_price = valid_history_prices[comp_idx + 1]
+
+            if current_price < last_db_price < prev_db_price:
+                return "WATCH (Falling Price)"
+
     if target_price is not None and current_price <= target_price:
         return "BUY (Below Target)"
-
-    # Check if it's an historical low
-    valid_history_prices: List[float] = [h[0] for h in history if h[0] is not None]
 
     if len(valid_history_prices) >= 3:
         min_hist = min(valid_history_prices)
@@ -216,6 +231,9 @@ def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
     print("  Price History (Trend):")
     max_bar_width = 30
 
+    previous_price: Optional[float] = None
+    lines: List[str] = []
+
     for price, date in chrono_history:
         if price is None:
             continue
@@ -228,8 +246,24 @@ def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
             pct = (price - min_p) / distinct_range
             bar_len = 1 + int(pct * (max_bar_width - 1))
 
+        # Determine color
+        bar_color = Colors.ENDC
+        if previous_price is not None:
+            if price > previous_price:
+                bar_color = Colors.RED
+            elif price < previous_price:
+                bar_color = Colors.GREEN
+            else:
+                bar_color = Colors.YELLOW
+
+        previous_price = price
+
         ascii_bar = '#' * bar_len
-        print(f"    {date_short}: {ascii_bar:<30} ${price:.2f}")
+        lines.append(f"    {date_short}: {bar_color}{ascii_bar:<30}{Colors.ENDC} ${price:.2f}")
+
+    # Print Newest -> Oldest
+    for line in reversed(lines):
+        print(line)
 
 # --- Colors ---
 class Colors:
@@ -295,6 +329,8 @@ def process_cards(cards: List[CardData], conn: Optional[sqlite3.Connection],
         rec_color = Colors.ENDC
         if "BUY" in recommendation:
             rec_color = Colors.GREEN
+        elif "WATCH" in recommendation:
+            rec_color = Colors.BLUE
         elif "WAIT" in recommendation:
             rec_color = Colors.YELLOW
         elif "UNKNOWN" in recommendation:
@@ -305,8 +341,15 @@ def process_cards(cards: List[CardData], conn: Optional[sqlite3.Connection],
             save_price(conn, card, current_price)
 
         # 5. Output
+        price_color = Colors.CYAN
+        if card['target_price'] is not None and current_price is not None:
+            if current_price <= card['target_price']:
+                price_color = Colors.GREEN
+            else:
+                price_color = Colors.RED
+
         price_str = f"${current_price:.2f}" if current_price else "N/A"
-        print(f"  Current Price: {Colors.CYAN}{price_str}{Colors.ENDC}")
+        print(f"  Current Price: {price_color}{price_str}{Colors.ENDC}")
         if card['target_price'] is not None:
             print(f"  Target Price:  ${card['target_price']:.2f}")
 
