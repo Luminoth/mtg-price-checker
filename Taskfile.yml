@@ -1,0 +1,17 @@
+version: "3"
+
+tasks:
+  default:
+    desc: Run the price checker with database and card list (Default Behavior)
+    cmds:
+      - python3 mtg_price_checker.py --db prices.db --list cards.json
+
+  check:
+    desc: Run strict type checking
+    cmds:
+      - mypy mtg_price_checker.py --strict
+
+  lint:
+    desc: Run linter
+    cmds:
+      - pylint mtg_price_checker.py

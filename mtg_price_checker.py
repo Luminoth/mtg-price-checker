@@ -7,33 +7,29 @@ A script to fetch and track Magic: The Gathering card prices from Scryfall.
 Stores history in a local SQLite database and provides BUY/WAIT recommendations.
 """
 
-import time
+import sys
+import argparse
+import json
 import sqlite3
 import datetime
-import os
+import time
+from typing import List, Tuple, Optional, Any, TypedDict
 import requests  # type: ignore
-from typing import List, Tuple, Optional, Any, Union
 
-# --- Configuration ---
-# List of cards to track: (Card Name, Set Code, Target Price USD, [Optional] Collector Number)
-CARD_LIST: List[Tuple[str, str, float, Optional[str]]] = [
-    ("Black Lotus", "LEA", 20000.00, None),
-    ("Mox Pearl", "LEA", 4000.00, None),
-    ("Underground Sea", "3ED", 600.00, None),
-    ("Volcanic Island", "3ED", 600.00, None),
-    ("Tropical Island", "3ED", 500.00, None),
-    ("Force of Will", "ALL", 80.00, None),
-    ("Tarmogoyf", "FUT", 100.00, None), # Just for fun, seeing how low it goes
-    ("Maha, Its Feathers Night", "BLB", 20.00, "289"), # Specific Showcase printing
-]
+# --- Types ---
 
-DB_FILE: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prices.db")
+class CardData(TypedDict):
+    """Structure for card data from JSON or CLI."""
+    name: str
+    set: str
+    target_price: Optional[float]
+    collector_number: Optional[str]
 
 # --- Database Functions ---
 
-def setup_database() -> sqlite3.Connection:
+def setup_database(db_path: str) -> sqlite3.Connection:
     """Creates the price_history table if it doesn't exist and handles migrations."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS price_history (
@@ -48,7 +44,6 @@ def setup_database() -> sqlite3.Connection:
     # Migration: Add collector_number column if it doesn't exist
     try:
         cursor.execute("ALTER TABLE price_history ADD COLUMN collector_number TEXT")
-        print("[Info] Added 'collector_number' column to database.")
     except sqlite3.OperationalError:
         # Column likely already exists
         pass
@@ -56,14 +51,14 @@ def setup_database() -> sqlite3.Connection:
     conn.commit()
     return conn
 
-def save_price(conn: sqlite3.Connection, card_name: str, set_code: str, price_usd: float, collector_number: Optional[str] = None) -> None:
+def save_price(conn: sqlite3.Connection, card: CardData, price_usd: float) -> None:
     """
     Saves the fetched price to the database, ensuring only one entry per day per card.
     """
     cursor = conn.cursor()
 
-    # Check if we already have an entry for today (UTC)
-    if collector_number:
+    params: Tuple[Any, ...]
+    if card['collector_number']:
         query = '''
             SELECT id FROM price_history
             WHERE card_name = ?
@@ -71,8 +66,7 @@ def save_price(conn: sqlite3.Connection, card_name: str, set_code: str, price_us
               AND collector_number = ?
               AND date(fetched_at) = date('now')
         '''
-        params: Tuple[str, str, str] = (card_name, set_code, collector_number)
-        cursor.execute(query, params)
+        params = (card['name'], card['set'], card['collector_number'])
     else:
         query = '''
             SELECT id FROM price_history
@@ -81,57 +75,59 @@ def save_price(conn: sqlite3.Connection, card_name: str, set_code: str, price_us
               AND collector_number IS NULL
               AND date(fetched_at) = date('now')
         '''
-        params_no_cn: Tuple[str, str] = (card_name, set_code)
-        cursor.execute(query, params_no_cn)
+        params = (card['name'], card['set'])
+
+    cursor.execute(query, params)
 
     if cursor.fetchone():
-        print(f"  [Info] Price for {card_name} already saved today.")
+        print(f"  [Info] Price for {card['name']} already saved today.")
         return
 
     cursor.execute('''
         INSERT INTO price_history (card_name, set_code, price_usd, collector_number)
         VALUES (?, ?, ?, ?)
-    ''', (card_name, set_code, price_usd, collector_number))
+    ''', (card['name'], card['set'], price_usd, card['collector_number']))
     conn.commit()
 
-def get_history(conn: sqlite3.Connection, card_name: str, set_code: str, collector_number: Optional[str] = None, limit: int = 5) -> List[Tuple[Optional[float], str]]:
+def get_history(conn: sqlite3.Connection, card: CardData, limit: int = 5) \
+        -> List[Tuple[Optional[float], str]]:
     """Retrieves the last N price entries for a specific card/set."""
     cursor = conn.cursor()
 
-    if collector_number:
+    if card['collector_number']:
         cursor.execute('''
             SELECT price_usd, fetched_at FROM price_history
             WHERE card_name = ? AND set_code = ? AND collector_number = ?
             ORDER BY fetched_at DESC
             LIMIT ?
-        ''', (card_name, set_code, collector_number, limit))
+        ''', (card['name'], card['set'], card['collector_number'], limit))
     else:
         cursor.execute('''
             SELECT price_usd, fetched_at FROM price_history
             WHERE card_name = ? AND set_code = ? AND collector_number IS NULL
             ORDER BY fetched_at DESC
             LIMIT ?
-        ''', (card_name, set_code, limit))
+        ''', (card['name'], card['set'], limit))
 
     return cursor.fetchall()
 
 # --- API Functions ---
 
-def get_card_price(card_name: str, set_code: str, collector_number: Optional[str] = None) -> Optional[float]:
+def get_card_price(card: CardData) -> Optional[float]:
     """
     Fetches the current non-foil market price for a specific card printing from Scryfall.
     Returns: price (float) or None if not found/no price.
     """
-    if collector_number:
+    if card['collector_number']:
         # Fetch by Set + Collector Number (Specific Printing)
-        url = f"https://api.scryfall.com/cards/{set_code.lower()}/{collector_number}"
+        url = f"https://api.scryfall.com/cards/{card['set'].lower()}/{card['collector_number']}"
         params = {}
     else:
         # Fetch by Name + Set
         url = "https://api.scryfall.com/cards/named"
         params = {
-            "exact": card_name,
-            "set": set_code
+            "exact": card['name'],
+            "set": card['set']
         }
 
     try:
@@ -141,9 +137,10 @@ def get_card_price(card_name: str, set_code: str, collector_number: Optional[str
 
         # Validate name if we fetched by collector number to avoid "wrong card" issues
         fetched_name = data.get("name")
-        if collector_number and fetched_name and card_name.lower() not in fetched_name.lower():
-            print(f"  {Colors.RED}Error: Collector number {collector_number} returned "
-                  f"'{fetched_name}', expected '{card_name}'{Colors.ENDC}")
+        if (card['collector_number'] and fetched_name and
+                card['name'].lower() not in fetched_name.lower()):
+            print(f"  {Colors.RED}Error: Collector number {card['collector_number']} returned "
+                  f"'{fetched_name}', expected '{card['name']}'{Colors.ENDC}")
             return None
 
         # Scryfall prices are in 'prices' object
@@ -153,36 +150,33 @@ def get_card_price(card_name: str, set_code: str, collector_number: Optional[str
         if price_usd:
             return float(price_usd)
 
-        print(f"  Warning: No USD price found for {card_name} ({set_code})")
+        print(f"  Warning: No USD price found for {card['name']} ({card['set']})")
         return None
 
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
-            cn_info = f" #{collector_number}" if collector_number else ""
-            print(f"  Error: Card not found: {card_name} ({set_code}{cn_info})")
+            cn_info = f" #{card['collector_number']}" if card['collector_number'] else ""
+            print(f"  Error: Card not found: {card['name']} ({card['set']}{cn_info})")
         else:
-            print(f"  API Error for {card_name}: {e}")
+            print(f"  API Error for {card['name']}: {e}")
         return None
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        print(f"  Unexpected error for {card_name}: {e}")
+    # pylint: disable=broad-exception-caught
+    except Exception as e:
+        print(f"  Unexpected error for {card['name']}: {e}")
         return None
 
 # --- Recommendation Logic ---
 
-def generate_recommendation(current_price: Optional[float], target_price: float, history: List[Tuple[Optional[float], str]]) -> str:
+def generate_recommendation(current_price: Optional[float],
+                            target_price: Optional[float],
+                            history: List[Tuple[Optional[float], str]]) -> str:
     """
     Generates a BUY/WAIT/NEUTRAL recommendation.
-
-    Logic:
-    - BUY: Current price <= Target Price
-    - BUY: Current price < All-time low in known history (min 3 entries)
-    - WAIT: Price > Target
-    - NEUTRAL: No valid price or insufficient data
     """
     if current_price is None:
         return "UNKNOWN"
 
-    if current_price <= target_price:
+    if target_price is not None and current_price <= target_price:
         return "BUY (Below Target)"
 
     # Check if it's an historical low
@@ -193,7 +187,10 @@ def generate_recommendation(current_price: Optional[float], target_price: float,
         if current_price < min_hist:
             return "BUY (New Low)"
 
-    return "WAIT"
+    if target_price is not None and current_price > target_price:
+        return "WAIT"
+
+    return "NEUTRAL"
 
 # --- Visualization ---
 
@@ -250,39 +247,49 @@ class Colors:
 
 # --- Main Execution ---
 
-def main() -> None:
-    """Main execution function."""
-    print(f"{Colors.HEADER}--- MTG Price Fetcher ---{Colors.ENDC}")
-    print(f"Timestamp: {datetime.datetime.now()}")
+def load_cards_from_file(filepath: str) -> List[CardData]:
+    """Loads card list from a JSON file."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            # Basic validation
+            cards: List[CardData] = []
+            for item in data:
+                cards.append({
+                    "name": item.get("name"),
+                    "set": item.get("set"),
+                    "target_price": item.get("target_price"),
+                    "collector_number": item.get("collector_number")
+                })
+            return cards
+    except FileNotFoundError:
+        print(f"{Colors.RED}Error: File '{filepath}' not found.{Colors.ENDC}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"{Colors.RED}Error: Failed to parse '{filepath}': {e}{Colors.ENDC}")
+        sys.exit(1)
 
-    conn = setup_database()
+def process_cards(cards: List[CardData], conn: Optional[sqlite3.Connection],
+                  use_db: bool) -> None:
+    """Iterates through cards and processes them."""
+    for card in cards:
+        cn_str = f" #{card['collector_number']}" if card['collector_number'] else ""
+        print(f"\n{Colors.BOLD}Checking: {card['name']} [{card['set']}{cn_str}]...{Colors.ENDC}")
 
-    for item in CARD_LIST:
-        # Unpack tuple with optional collector number
-        card_name: str
-        set_code: str
-        target_price: float
-        collector_number_val: Optional[str]
-
-        # Since we typed CARD_LIST with Optional[str] at the 4th position,
-        # we can unpack it directly, making sure tuples in CARD_LIST are uniformly 4 elements long or handled correctly.
-        # However, the original code allowed 3-tuples.
-        # To be strict, let's normalize CARD_LIST logic or handle different lengths explicitly again if we can't change the list structure to be uniform easily.
-        # The update to CARD_LIST above added None to the 3-tuples, making them 4-tuples.
-
-        card_name, set_code, target_price, collector_number_val = item
-
-        cn_str = f" #{collector_number_val}" if collector_number_val else ""
-        print(f"\n{Colors.BOLD}Checking: {card_name} [{set_code}{cn_str}]...{Colors.ENDC}")
-
-        # 1. Get History (before saving new one, to see previous state)
-        history = get_history(conn, card_name, set_code, collector_number_val)
+        # 1. Get History (if DB)
+        history: List[Tuple[Optional[float], str]] = []
+        if conn:
+            history = get_history(conn, card)
 
         # 2. Get Current Price
-        current_price = get_card_price(card_name, set_code, collector_number_val)
+        current_price = get_card_price(card)
 
         # 3. Recommendation
-        recommendation = generate_recommendation(current_price, target_price, history)
+        # Only show recommendation if we have a target price or history
+        recommendation = "N/A"
+        if use_db or card['target_price'] is not None:
+            recommendation = generate_recommendation(current_price, card['target_price'],
+                                                     history)
 
         # Colorize Recommendation
         rec_color = Colors.ENDC
@@ -294,29 +301,94 @@ def main() -> None:
             rec_color = Colors.RED
 
         # 4. Save to DB
-        if current_price is not None:
-            save_price(conn, card_name, set_code, current_price, collector_number_val)
+        if conn and current_price is not None:
+            save_price(conn, card, current_price)
 
         # 5. Output
         price_str = f"${current_price:.2f}" if current_price else "N/A"
         print(f"  Current Price: {Colors.CYAN}{price_str}{Colors.ENDC}")
-        print(f"  Target Price:  ${target_price:.2f}")
-        print(f"  Recommendation: {rec_color}{recommendation}{Colors.ENDC}")
+        if card['target_price'] is not None:
+            print(f"  Target Price:  ${card['target_price']:.2f}")
 
-        # Refetch history to include the latest save for the graph (and get more points)
-        history = get_history(conn, card_name, set_code, collector_number_val, limit=14)
+        if recommendation != "N/A":
+            print(f"  Recommendation: {rec_color}{recommendation}{Colors.ENDC}")
 
-        if history:
-            render_ascii_graph(history)
-        else:
-            print("  No history available.")
+        # Refetch history for graph
+        if conn:
+            history = get_history(conn, card, limit=14)
+            if history:
+                render_ascii_graph(history)
+            else:
+                print("  No history available.")
 
         # Rate limiting behavior
         time.sleep(0.1)
 
-    conn.close()
-    print("\nDone.")
+def main() -> None:
+    """Main execution function."""
+    parser = argparse.ArgumentParser(description="MTG Price Checker")
+    parser.add_argument("--db", help="Path to sqlite database file", default=None)
+    parser.add_argument("--list", help="Path to JSON card list file", default=None)
+    parser.add_argument("card_info", nargs="*", help="[Name] [Set] [TargetPrice] [CollectorNum]")
 
+    args = parser.parse_args()
+
+    cards_to_check: List[CardData] = []
+
+    # Logic Priority:
+    # 1. List file
+    if args.list:
+        cards_to_check = load_cards_from_file(args.list)
+
+    # 2. Positional Args (Single Card)
+    elif args.card_info and len(args.card_info) >= 2:
+        name = args.card_info[0]
+        set_code = args.card_info[1]
+        target_price: Optional[float] = None
+        collector_number: Optional[str] = None
+
+        if args.db and len(args.card_info) < 3:
+            print(f"{Colors.RED}Error: When using --db, TargetPrice is required "
+                  f"for single card mode.{Colors.ENDC}")
+            print("Usage: mtg_price_checker.py --db DB 'Name' 'Set' 'TargetPrice' [CollectorNum]")
+            sys.exit(1)
+
+        if len(args.card_info) >= 3:
+            try:
+                target_price = float(args.card_info[2])
+            except ValueError:
+                print(f"{Colors.RED}Error: TargetPrice must be a number.{Colors.ENDC}")
+                print(f"{Colors.YELLOW}Hint: If your card name has spaces, make sure to "
+                      f"wrap it in quotes (e.g., \"Black Lotus\").{Colors.ENDC}")
+                sys.exit(1)
+
+        if len(args.card_info) >= 4:
+            collector_number = args.card_info[3]
+
+        cards_to_check = [{
+            "name": name,
+            "set": set_code,
+            "target_price": target_price,
+            "collector_number": collector_number
+        }]
+
+    # 3. No inputs -> Error
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    print(f"{Colors.HEADER}--- MTG Price Fetcher ---{Colors.ENDC}")
+    print(f"Timestamp: {datetime.datetime.now()}")
+
+    conn: Optional[sqlite3.Connection] = None
+    if args.db:
+        conn = setup_database(args.db)
+
+    process_cards(cards_to_check, conn, bool(args.db))
+
+    if conn:
+        conn.close()
+    print("\nDone.")
 
 if __name__ == "__main__":
     main()

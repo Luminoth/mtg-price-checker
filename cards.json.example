@@ -1,0 +1,43 @@
+[
+  {
+    "name": "Black Lotus",
+    "set": "LEA",
+    "target_price": 20000.0
+  },
+  {
+    "name": "Mox Pearl",
+    "set": "LEA",
+    "target_price": 4000.0
+  },
+  {
+    "name": "Underground Sea",
+    "set": "3ED",
+    "target_price": 600.0
+  },
+  {
+    "name": "Volcanic Island",
+    "set": "3ED",
+    "target_price": 600.0
+  },
+  {
+    "name": "Tropical Island",
+    "set": "3ED",
+    "target_price": 500.0
+  },
+  {
+    "name": "Force of Will",
+    "set": "ALL",
+    "target_price": 80.0
+  },
+  {
+    "name": "Tarmogoyf",
+    "set": "FUT",
+    "target_price": 100.0
+  },
+  {
+    "name": "Maha, Its Feathers Night",
+    "set": "BLB",
+    "collector_number": "289",
+    "target_price": 20.0
+  }
+]
