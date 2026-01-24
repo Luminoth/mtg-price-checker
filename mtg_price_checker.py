@@ -1,7 +1,11 @@
 #! /usr/bin/env python3
 
-# pylint: disable=missing-module-docstring, missing-class-docstring, missing-function-docstring
-
+"""
+MTG Price Checker
+-----------------
+A script to fetch and track Magic: The Gathering card prices from Scryfall.
+Stores history in a local SQLite database and provides BUY/WAIT recommendations.
+"""
 
 import time
 import sqlite3
@@ -130,14 +134,15 @@ def get_card_price(card_name, set_code, collector_number=None):
         }
 
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=10)
         response.raise_for_status() # Raise error for 404, 500 etc
         data = response.json()
 
         # Validate name if we fetched by collector number to avoid "wrong card" issues
         fetched_name = data.get("name")
         if collector_number and fetched_name and card_name.lower() not in fetched_name.lower():
-            print(f"  {Colors.RED}Error: Collector number {collector_number} returned '{fetched_name}', expected '{card_name}'{Colors.ENDC}")
+            print(f"  {Colors.RED}Error: Collector number {collector_number} returned "
+                  f"'{fetched_name}', expected '{card_name}'{Colors.ENDC}")
             return None
 
         # Scryfall prices are in 'prices' object
@@ -146,9 +151,9 @@ def get_card_price(card_name, set_code, collector_number=None):
 
         if price_usd:
             return float(price_usd)
-        else:
-            print(f"  Warning: No USD price found for {card_name} ({set_code})")
-            return None
+
+        print(f"  Warning: No USD price found for {card_name} ({set_code})")
+        return None
 
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
@@ -157,7 +162,7 @@ def get_card_price(card_name, set_code, collector_number=None):
         else:
             print(f"  API Error for {card_name}: {e}")
         return None
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-exception-caught
         print(f"  Unexpected error for {card_name}: {e}")
         return None
 
@@ -225,11 +230,13 @@ def render_ascii_graph(history):
             pct = (price - min_p) / distinct_range
             bar_len = 1 + int(pct * (max_bar_width - 1))
 
-        bar = '#' * bar_len
-        print(f"    {date_short}: {bar:<30} ${price:.2f}")
+        ascii_bar = '#' * bar_len
+        print(f"    {date_short}: {ascii_bar:<30} ${price:.2f}")
 
 # --- Colors ---
 class Colors:
+    """ANSI color codes for terminal output."""
+    # pylint: disable=too-few-public-methods
     HEADER = '\033[95m'
     BLUE = '\033[94m'
     CYAN = '\033[96m'
@@ -242,7 +249,8 @@ class Colors:
 
 # --- Main Execution ---
 
-if __name__ == "__main__":
+def main():
+    """Main execution function."""
     print(f"{Colors.HEADER}--- MTG Price Fetcher ---{Colors.ENDC}")
     print(f"Timestamp: {datetime.datetime.now()}")
 
@@ -251,19 +259,19 @@ if __name__ == "__main__":
     for item in CARD_LIST:
         # Unpack tuple with optional collector number
         if len(item) == 4:
-            card_name, set_code, target_price, collector_number = item
+            card_name, set_code, target_price, collector_number_val = item
         else:
             card_name, set_code, target_price = item
-            collector_number = None
+            collector_number_val = None
 
-        cn_str = f" #{collector_number}" if collector_number else ""
+        cn_str = f" #{collector_number_val}" if collector_number_val else ""
         print(f"\n{Colors.BOLD}Checking: {card_name} [{set_code}{cn_str}]...{Colors.ENDC}")
 
         # 1. Get History (before saving new one, to see previous state)
-        history = get_history(conn, card_name, set_code, collector_number)
+        history = get_history(conn, card_name, set_code, collector_number_val)
 
         # 2. Get Current Price
-        current_price = get_card_price(card_name, set_code, collector_number)
+        current_price = get_card_price(card_name, set_code, collector_number_val)
 
         # 3. Recommendation
         recommendation = generate_recommendation(current_price, target_price, history)
@@ -279,7 +287,7 @@ if __name__ == "__main__":
 
         # 4. Save to DB
         if current_price is not None:
-            save_price(conn, card_name, set_code, current_price, collector_number)
+            save_price(conn, card_name, set_code, current_price, collector_number_val)
 
         # 5. Output
         price_str = f"${current_price:.2f}" if current_price else "N/A"
@@ -288,7 +296,7 @@ if __name__ == "__main__":
         print(f"  Recommendation: {rec_color}{recommendation}{Colors.ENDC}")
 
         # Refetch history to include the latest save for the graph (and get more points)
-        history = get_history(conn, card_name, set_code, collector_number, limit=14)
+        history = get_history(conn, card_name, set_code, collector_number_val, limit=14)
 
         if history:
             render_ascii_graph(history)
@@ -300,3 +308,7 @@ if __name__ == "__main__":
 
     conn.close()
     print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
