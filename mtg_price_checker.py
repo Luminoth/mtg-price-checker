@@ -11,26 +11,27 @@ import time
 import sqlite3
 import datetime
 import os
-import requests
+import requests  # type: ignore
+from typing import List, Tuple, Optional, Any, Union
 
 # --- Configuration ---
 # List of cards to track: (Card Name, Set Code, Target Price USD, [Optional] Collector Number)
-CARD_LIST = [
-    ("Black Lotus", "LEA", 20000.00),
-    ("Mox Pearl", "LEA", 4000.00),
-    ("Underground Sea", "3ED", 600.00),
-    ("Volcanic Island", "3ED", 600.00),
-    ("Tropical Island", "3ED", 500.00),
-    ("Force of Will", "ALL", 80.00),
-    ("Tarmogoyf", "FUT", 100.00), # Just for fun, seeing how low it goes
+CARD_LIST: List[Tuple[str, str, float, Optional[str]]] = [
+    ("Black Lotus", "LEA", 20000.00, None),
+    ("Mox Pearl", "LEA", 4000.00, None),
+    ("Underground Sea", "3ED", 600.00, None),
+    ("Volcanic Island", "3ED", 600.00, None),
+    ("Tropical Island", "3ED", 500.00, None),
+    ("Force of Will", "ALL", 80.00, None),
+    ("Tarmogoyf", "FUT", 100.00, None), # Just for fun, seeing how low it goes
     ("Maha, Its Feathers Night", "BLB", 20.00, "289"), # Specific Showcase printing
 ]
 
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prices.db")
+DB_FILE: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prices.db")
 
 # --- Database Functions ---
 
-def setup_database():
+def setup_database() -> sqlite3.Connection:
     """Creates the price_history table if it doesn't exist and handles migrations."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -55,7 +56,7 @@ def setup_database():
     conn.commit()
     return conn
 
-def save_price(conn, card_name, set_code, price_usd, collector_number=None):
+def save_price(conn: sqlite3.Connection, card_name: str, set_code: str, price_usd: float, collector_number: Optional[str] = None) -> None:
     """
     Saves the fetched price to the database, ensuring only one entry per day per card.
     """
@@ -70,7 +71,8 @@ def save_price(conn, card_name, set_code, price_usd, collector_number=None):
               AND collector_number = ?
               AND date(fetched_at) = date('now')
         '''
-        params = (card_name, set_code, collector_number)
+        params: Tuple[str, str, str] = (card_name, set_code, collector_number)
+        cursor.execute(query, params)
     else:
         query = '''
             SELECT id FROM price_history
@@ -79,9 +81,8 @@ def save_price(conn, card_name, set_code, price_usd, collector_number=None):
               AND collector_number IS NULL
               AND date(fetched_at) = date('now')
         '''
-        params = (card_name, set_code)
-
-    cursor.execute(query, params)
+        params_no_cn: Tuple[str, str] = (card_name, set_code)
+        cursor.execute(query, params_no_cn)
 
     if cursor.fetchone():
         print(f"  [Info] Price for {card_name} already saved today.")
@@ -93,7 +94,7 @@ def save_price(conn, card_name, set_code, price_usd, collector_number=None):
     ''', (card_name, set_code, price_usd, collector_number))
     conn.commit()
 
-def get_history(conn, card_name, set_code, collector_number=None, limit=5):
+def get_history(conn: sqlite3.Connection, card_name: str, set_code: str, collector_number: Optional[str] = None, limit: int = 5) -> List[Tuple[Optional[float], str]]:
     """Retrieves the last N price entries for a specific card/set."""
     cursor = conn.cursor()
 
@@ -116,7 +117,7 @@ def get_history(conn, card_name, set_code, collector_number=None, limit=5):
 
 # --- API Functions ---
 
-def get_card_price(card_name, set_code, collector_number=None):
+def get_card_price(card_name: str, set_code: str, collector_number: Optional[str] = None) -> Optional[float]:
     """
     Fetches the current non-foil market price for a specific card printing from Scryfall.
     Returns: price (float) or None if not found/no price.
@@ -168,7 +169,7 @@ def get_card_price(card_name, set_code, collector_number=None):
 
 # --- Recommendation Logic ---
 
-def generate_recommendation(current_price, target_price, history):
+def generate_recommendation(current_price: Optional[float], target_price: float, history: List[Tuple[Optional[float], str]]) -> str:
     """
     Generates a BUY/WAIT/NEUTRAL recommendation.
 
@@ -185,7 +186,7 @@ def generate_recommendation(current_price, target_price, history):
         return "BUY (Below Target)"
 
     # Check if it's an historical low
-    valid_history_prices = [h[0] for h in history if h[0] is not None]
+    valid_history_prices: List[float] = [h[0] for h in history if h[0] is not None]
 
     if len(valid_history_prices) >= 3:
         min_hist = min(valid_history_prices)
@@ -196,7 +197,7 @@ def generate_recommendation(current_price, target_price, history):
 
 # --- Visualization ---
 
-def render_ascii_graph(history):
+def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
     """
     Renders a simple ASCII bar chart for the given history.
     History is expected to be a list of (price, date_str).
@@ -207,7 +208,7 @@ def render_ascii_graph(history):
     # Sort by date ascending (Oldest first)
     chrono_history = sorted(history, key=lambda x: x[1])
 
-    prices = [h[0] for h in chrono_history if h[0] is not None]
+    prices: List[float] = [h[0] for h in chrono_history if h[0] is not None]
     if not prices:
         return
 
@@ -249,7 +250,7 @@ class Colors:
 
 # --- Main Execution ---
 
-def main():
+def main() -> None:
     """Main execution function."""
     print(f"{Colors.HEADER}--- MTG Price Fetcher ---{Colors.ENDC}")
     print(f"Timestamp: {datetime.datetime.now()}")
@@ -258,11 +259,18 @@ def main():
 
     for item in CARD_LIST:
         # Unpack tuple with optional collector number
-        if len(item) == 4:
-            card_name, set_code, target_price, collector_number_val = item
-        else:
-            card_name, set_code, target_price = item
-            collector_number_val = None
+        card_name: str
+        set_code: str
+        target_price: float
+        collector_number_val: Optional[str]
+
+        # Since we typed CARD_LIST with Optional[str] at the 4th position,
+        # we can unpack it directly, making sure tuples in CARD_LIST are uniformly 4 elements long or handled correctly.
+        # However, the original code allowed 3-tuples.
+        # To be strict, let's normalize CARD_LIST logic or handle different lengths explicitly again if we can't change the list structure to be uniform easily.
+        # The update to CARD_LIST above added None to the 3-tuples, making them 4-tuples.
+
+        card_name, set_code, target_price, collector_number_val = item
 
         cn_str = f" #{collector_number_val}" if collector_number_val else ""
         print(f"\n{Colors.BOLD}Checking: {card_name} [{set_code}{cn_str}]...{Colors.ENDC}")
