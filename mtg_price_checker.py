@@ -4,7 +4,7 @@
 MTG Price Checker
 -----------------
 A script to fetch and track Magic: The Gathering card prices from Scryfall.
-Stores history in a local SQLite database and provides BUY/WAIT recommendations.
+Stores history in a local SQLite database or DynamoDB, and provides BUY/WAIT recommendations.
 """
 
 import sys
@@ -13,8 +13,21 @@ import json
 import sqlite3
 import datetime
 import time
+import os
 from typing import List, Tuple, Optional, Any, TypedDict
 import requests  # type: ignore
+
+# Try to import boto3
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    BOTO3_AVAILABLE = True
+except ImportError:
+    BOTO3_AVAILABLE = False
+
+# --- Constants ---
+
+DYNAMODB_TABLE_NAME = "mtg_prices"
 
 # --- Types ---
 
@@ -25,91 +38,258 @@ class CardData(TypedDict):
     target_price: Optional[float]
     collector_number: Optional[str]
 
-# --- Database Functions ---
+# --- Colors ---
+class Colors:
+    """ANSI color codes for terminal output."""
+    # pylint: disable=too-few-public-methods
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
-def setup_database(db_path: str) -> sqlite3.Connection:
-    """Creates the price_history table if it doesn't exist and handles migrations."""
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS price_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            card_name TEXT NOT NULL,
-            set_code TEXT NOT NULL,
-            price_usd REAL,
-            fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+# --- Database Interface ---
 
-    # Migration: Add collector_number column if it doesn't exist
-    try:
-        cursor.execute("ALTER TABLE price_history ADD COLUMN collector_number TEXT")
-    except sqlite3.OperationalError:
-        # Column likely already exists
+class DatabaseInterface:
+    def setup(self) -> None:
+        raise NotImplementedError
+
+    def save_price(self, card: CardData, price_usd: float) -> None:
+        raise NotImplementedError
+
+    def get_history(self, card: CardData, limit: int = 5) -> List[Tuple[Optional[float], str]]:
+        raise NotImplementedError
+
+    def remove_card(self, card_name: str) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
         pass
 
-    conn.commit()
-    return conn
+class SQLiteBackend(DatabaseInterface):
+    def __init__(self, db_file: str):
+        self.db_file = db_file
+        self.conn: Optional[sqlite3.Connection] = None
 
-def save_price(conn: sqlite3.Connection, card: CardData, price_usd: float) -> None:
-    """
-    Saves the fetched price to the database, ensuring only one entry per day per card.
-    """
-    cursor = conn.cursor()
-
-    params: Tuple[Any, ...]
-    if card['collector_number']:
-        query = '''
-            SELECT id FROM price_history
-            WHERE card_name = ?
-              AND set_code = ?
-              AND collector_number = ?
-              AND date(fetched_at) = date('now')
-        '''
-        params = (card['name'], card['set'], card['collector_number'])
-    else:
-        query = '''
-            SELECT id FROM price_history
-            WHERE card_name = ?
-              AND set_code = ?
-              AND collector_number IS NULL
-              AND date(fetched_at) = date('now')
-        '''
-        params = (card['name'], card['set'])
-
-    cursor.execute(query, params)
-
-    if cursor.fetchone():
-        print(f"  [Info] Price for {card['name']} already saved today.")
-        return
-
-    cursor.execute('''
-        INSERT INTO price_history (card_name, set_code, price_usd, collector_number)
-        VALUES (?, ?, ?, ?)
-    ''', (card['name'], card['set'], price_usd, card['collector_number']))
-    conn.commit()
-
-def get_history(conn: sqlite3.Connection, card: CardData, limit: int = 5) \
-        -> List[Tuple[Optional[float], str]]:
-    """Retrieves the last N price entries for a specific card/set."""
-    cursor = conn.cursor()
-
-    if card['collector_number']:
+    def setup(self) -> None:
+        """Creates the price_history table if it doesn't exist and handles migrations."""
+        self.conn = sqlite3.connect(self.db_file)
+        cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT price_usd, fetched_at FROM price_history
-            WHERE card_name = ? AND set_code = ? AND collector_number = ?
-            ORDER BY fetched_at DESC
-            LIMIT ?
-        ''', (card['name'], card['set'], card['collector_number'], limit))
-    else:
-        cursor.execute('''
-            SELECT price_usd, fetched_at FROM price_history
-            WHERE card_name = ? AND set_code = ? AND collector_number IS NULL
-            ORDER BY fetched_at DESC
-            LIMIT ?
-        ''', (card['name'], card['set'], limit))
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                card_name TEXT NOT NULL,
+                set_code TEXT NOT NULL,
+                price_usd REAL,
+                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
 
-    return cursor.fetchall()
+        # Migration: Add collector_number column if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE price_history ADD COLUMN collector_number TEXT")
+        except sqlite3.OperationalError:
+            # Column likely already exists
+            pass
+        self.conn.commit()
+
+    def save_price(self, card: CardData, price_usd: float) -> None:
+        if not self.conn:
+            return
+        cursor = self.conn.cursor()
+
+        params: Tuple[Any, ...]
+        if card['collector_number']:
+            query = '''
+                SELECT id FROM price_history
+                WHERE card_name = ?
+                  AND set_code = ?
+                  AND collector_number = ?
+                  AND date(fetched_at) = date('now')
+            '''
+            params = (card['name'], card['set'], card['collector_number'])
+        else:
+            query = '''
+                SELECT id FROM price_history
+                WHERE card_name = ?
+                  AND set_code = ?
+                  AND collector_number IS NULL
+                  AND date(fetched_at) = date('now')
+            '''
+            params = (card['name'], card['set'])
+
+        cursor.execute(query, params)
+
+        if cursor.fetchone():
+            print(f"  [Info] Price for {card['name']} already saved today.")
+            return
+
+        cursor.execute('''
+            INSERT INTO price_history (card_name, set_code, price_usd, collector_number)
+            VALUES (?, ?, ?, ?)
+        ''', (card['name'], card['set'], price_usd, card['collector_number']))
+        self.conn.commit()
+
+    def get_history(self, card: CardData, limit: int = 5) \
+            -> List[Tuple[Optional[float], str]]:
+        if not self.conn:
+            return []
+        cursor = self.conn.cursor()
+
+        if card['collector_number']:
+            cursor.execute('''
+                SELECT price_usd, fetched_at FROM price_history
+                WHERE card_name = ? AND set_code = ? AND collector_number = ?
+                ORDER BY fetched_at DESC
+                LIMIT ?
+            ''', (card['name'], card['set'], card['collector_number'], limit))
+        else:
+            cursor.execute('''
+                SELECT price_usd, fetched_at FROM price_history
+                WHERE card_name = ? AND set_code = ? AND collector_number IS NULL
+                ORDER BY fetched_at DESC
+                LIMIT ?
+            ''', (card['name'], card['set'], limit))
+
+        return cursor.fetchall()
+
+    def remove_card(self, card_name: str) -> None:
+        if not self.conn:
+            return
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM price_history WHERE card_name = ?", (card_name,))
+        deleted_count = cursor.rowcount
+        self.conn.commit()
+        print(f"{Colors.GREEN}Deleted {deleted_count} entries for card '{card_name}' from SQLite.{Colors.ENDC}")
+
+    def close(self) -> None:
+        if self.conn:
+            self.conn.close()
+
+class DynamoDBBackend(DatabaseInterface):
+    def __init__(self, table_name: str):
+        if not BOTO3_AVAILABLE:
+            print(f"{Colors.RED}Error: boto3 is not installed. Please install it to use DynamoDB.{Colors.ENDC}")
+            sys.exit(1)
+        self.table_name = table_name
+        self.dynamodb = boto3.resource('dynamodb')
+        self.table = self.dynamodb.Table(table_name)
+
+    def setup(self) -> None:
+        # We assume table is created via Terraform/external means, but we can check if it exists
+        try:
+            self.table.load()
+        except ClientError as e:
+            print(f"{Colors.RED}Error accessing DynamoDB table '{self.table_name}': {e}{Colors.ENDC}")
+            sys.exit(1)
+
+    def _get_card_id(self, card_name: str, set_code: str, collector_number: Optional[str] = None) -> str:
+        """Generates a composite key for the card."""
+        parts = [card_name, set_code]
+        if collector_number:
+            parts.append(collector_number)
+        return "|".join(parts)
+
+    def save_price(self, card: CardData, price_usd: float) -> None:
+        card_id = self._get_card_id(card['name'], card['set'], card['collector_number'])
+        now_iso = datetime.datetime.utcnow().isoformat()
+
+        today_prefix = now_iso.split('T')[0]
+
+        try:
+            # Check for existing entry today
+            response = self.table.query(
+                KeyConditionExpression=boto3.dynamodb.conditions.Key('card_id').eq(card_id) &
+                                       boto3.dynamodb.conditions.Key('fetched_at').begins_with(today_prefix)
+            )
+
+            if response.get('Items'):
+                print(f"  [Info] Price for {card['name']} already saved today (DynamoDB).")
+                return
+
+            # Put Item
+            item = {
+                'card_id': card_id,
+                'fetched_at': now_iso,
+                'card_name': card['name'],
+                'set_code': card['set'],
+                'price_usd': str(price_usd),
+            }
+            if card['collector_number']:
+                item['collector_number'] = card['collector_number']
+
+            from decimal import Decimal
+            item['price_usd'] = Decimal(str(price_usd))
+
+            self.table.put_item(Item=item)
+
+        except ClientError as e:
+            print(f"  {Colors.RED}DynamoDB Error saving {card['name']}: {e}{Colors.ENDC}")
+
+    def get_history(self, card: CardData, limit: int = 5) -> List[Tuple[Optional[float], str]]:
+        card_id = self._get_card_id(card['name'], card['set'], card['collector_number'])
+
+        try:
+            response = self.table.query(
+                KeyConditionExpression=boto3.dynamodb.conditions.Key('card_id').eq(card_id),
+                ScanIndexForward=False, # Descending order
+                Limit=limit
+            )
+
+            items = response.get('Items', [])
+            history: List[Tuple[Optional[float], str]] = []
+            for item in items:
+                price = float(item['price_usd'])
+                fetched_at = item['fetched_at']
+                history.append((price, fetched_at))
+
+            return history
+
+        except ClientError as e:
+            print(f"  {Colors.RED}DynamoDB Error fetching history for {card['name']}: {e}{Colors.ENDC}")
+            return []
+
+    def remove_card(self, card_name: str) -> None:
+        print(f"Scanning DynamoDB for items with card_name='{card_name}'...")
+        try:
+            scan_kwargs: dict = {
+                'FilterExpression': boto3.dynamodb.conditions.Attr('card_name').eq(card_name),
+                'ProjectionExpression': 'card_id, fetched_at'
+            }
+            done = False
+            start_key = None
+            items_to_delete = []
+
+            while not done:
+                if start_key:
+                    scan_kwargs['ExclusiveStartKey'] = start_key
+                response = self.table.scan(**scan_kwargs)
+                items_to_delete.extend(response.get('Items', []))
+                start_key = response.get('LastEvaluatedKey', None)
+                done = start_key is None
+
+            if not items_to_delete:
+                print(f"No items found for '{card_name}' in DynamoDB.")
+                return
+
+            print(f"Found {len(items_to_delete)} items. Deleting...")
+
+            with self.table.batch_writer() as batch:
+                for item in items_to_delete:
+                    batch.delete_item(
+                        Key={
+                            'card_id': item['card_id'],
+                            'fetched_at': item['fetched_at']
+                        }
+                    )
+            print(f"{Colors.GREEN}Successfully deleted {len(items_to_delete)} items from DynamoDB.{Colors.ENDC}")
+
+        except ClientError as e:
+            print(f"{Colors.RED}DynamoDB Error deleting {card_name}: {e}{Colors.ENDC}")
 
 # --- API Functions ---
 
@@ -238,7 +418,7 @@ def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
         if price is None:
             continue
 
-        date_short = date.split(' ')[0]
+        date_short = date.split(' ')[0] # Split T from ISO or space from SQL
 
         if distinct_range == 0:
             bar_len = max_bar_width // 2
@@ -265,20 +445,6 @@ def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
     for line in reversed(lines):
         print(line)
 
-# --- Colors ---
-class Colors:
-    """ANSI color codes for terminal output."""
-    # pylint: disable=too-few-public-methods
-    HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-
 # --- Main Execution ---
 
 def load_cards_from_file(filepath: str) -> List[CardData]:
@@ -303,7 +469,7 @@ def load_cards_from_file(filepath: str) -> List[CardData]:
         print(f"{Colors.RED}Error: Failed to parse '{filepath}': {e}{Colors.ENDC}")
         sys.exit(1)
 
-def process_cards(cards: List[CardData], conn: Optional[sqlite3.Connection],
+def process_cards(cards: List[CardData], db: Optional[DatabaseInterface],
                   use_db: bool) -> None:
     """Iterates through cards and processes them."""
     for card in cards:
@@ -312,8 +478,8 @@ def process_cards(cards: List[CardData], conn: Optional[sqlite3.Connection],
 
         # 1. Get History (if DB)
         history: List[Tuple[Optional[float], str]] = []
-        if conn:
-            history = get_history(conn, card)
+        if db:
+            history = db.get_history(card)
 
         # 2. Get Current Price
         current_price = get_card_price(card)
@@ -337,8 +503,8 @@ def process_cards(cards: List[CardData], conn: Optional[sqlite3.Connection],
             rec_color = Colors.RED
 
         # 4. Save to DB
-        if conn and current_price is not None:
-            save_price(conn, card, current_price)
+        if db and current_price is not None:
+            db.save_price(card, current_price)
 
         # 5. Output
         price_color = Colors.CYAN
@@ -357,8 +523,8 @@ def process_cards(cards: List[CardData], conn: Optional[sqlite3.Connection],
             print(f"  Recommendation: {rec_color}{recommendation}{Colors.ENDC}")
 
         # Refetch history for graph
-        if conn:
-            history = get_history(conn, card, limit=14)
+        if db:
+            history = db.get_history(card, limit=14)
             if history:
                 render_ascii_graph(history)
             else:
@@ -370,12 +536,48 @@ def process_cards(cards: List[CardData], conn: Optional[sqlite3.Connection],
 def main() -> None:
     """Main execution function."""
     parser = argparse.ArgumentParser(description="MTG Price Checker")
-    parser.add_argument("--db", help="Path to sqlite database file", default=None)
+    parser.add_argument("--database", choices=["sqlite", "dynamodb"], help="Database backend to use")
+    parser.add_argument("--sqlite-path", help="Path to sqlite database file (default: prices.db)", default="prices.db")
     parser.add_argument("--list", help="Path to JSON card list file", default=None)
+    parser.add_argument("--remove-card", type=str, metavar="NAME", help="Remove all data for a specific card name and exit")
+    parser.add_argument("--force", action="store_true", help="Force removal without confirmation (requires --remove-card)")
     parser.add_argument("card_info", nargs="*", help="[Name] [Set] [TargetPrice] [CollectorNum]")
 
     args = parser.parse_args()
 
+    # --- Validate Arguments ---
+    if args.force and not args.remove_card:
+        parser.error("--force can only be used with --remove-card")
+
+    # --- Initialize Database ---
+    db: Optional[DatabaseInterface] = None
+    if args.database == "dynamodb":
+        print("[Mode] DynamoDB")
+        db = DynamoDBBackend(DYNAMODB_TABLE_NAME)
+        db.setup()
+    elif args.database == "sqlite":
+        print(f"[Mode] SQLite ({args.sqlite_path})")
+        db = SQLiteBackend(args.sqlite_path)
+        db.setup()
+
+    # --- Handle Removal ---
+    if args.remove_card:
+        if not db:
+            print(f"{Colors.RED}Error: You must specify a --database to remove a card.{Colors.ENDC}")
+            sys.exit(1)
+
+        if not args.force:
+            confirm = input(f"{Colors.YELLOW}Are you sure you want to delete all entries for '{args.remove_card}'? [y/N] {Colors.ENDC}")
+            if confirm.lower() != 'y':
+                print("Operation cancelled.")
+                db.close()
+                sys.exit(0)
+
+        db.remove_card(args.remove_card)
+        db.close()
+        sys.exit(0)
+
+    # --- Handle Card Data ---
     cards_to_check: List[CardData] = []
 
     # Logic Priority:
@@ -390,10 +592,10 @@ def main() -> None:
         target_price: Optional[float] = None
         collector_number: Optional[str] = None
 
-        if args.db and len(args.card_info) < 3:
-            print(f"{Colors.RED}Error: When using --db, TargetPrice is required "
+        if args.database and len(args.card_info) < 3:
+            print(f"{Colors.RED}Error: When using a DB, TargetPrice is required "
                   f"for single card mode.{Colors.ENDC}")
-            print("Usage: mtg_price_checker.py --db DB 'Name' 'Set' 'TargetPrice' [CollectorNum]")
+            print("Usage: mtg_price_checker.py --database [sqlite|dynamodb] 'Name' 'Set' 'TargetPrice' [CollectorNum]")
             sys.exit(1)
 
         if len(args.card_info) >= 3:
@@ -423,14 +625,10 @@ def main() -> None:
     print(f"{Colors.HEADER}--- MTG Price Fetcher ---{Colors.ENDC}")
     print(f"Timestamp: {datetime.datetime.now()}")
 
-    conn: Optional[sqlite3.Connection] = None
-    if args.db:
-        conn = setup_database(args.db)
+    process_cards(cards_to_check, db, bool(db))
 
-    process_cards(cards_to_check, conn, bool(args.db))
-
-    if conn:
-        conn.close()
+    if db:
+        db.close()
     print("\nDone.")
 
 if __name__ == "__main__":
