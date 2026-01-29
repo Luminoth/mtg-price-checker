@@ -393,6 +393,7 @@ def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
     """
     Renders a simple ASCII bar chart for the given history.
     History is expected to be a list of (price, date_str).
+    Dates are converted from stored UTC to local time for display.
     """
     if not history:
         return
@@ -408,17 +409,32 @@ def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
     max_p = max(prices)
     distinct_range = max_p - min_p
 
-    print("  Price History (Trend):")
+    print("  Price History (Trend) - Local Time:")
     max_bar_width = 30
 
     previous_price: Optional[float] = None
     lines: List[str] = []
 
-    for price, date in chrono_history:
+    for price, date_str in chrono_history:
         if price is None:
             continue
 
-        date_short = date.split(' ')[0] # Split T from ISO or space from SQL
+        # Convert UTC string to Local Date String
+        try:
+            # Handle potential formats: "YYYY-MM-DD HH:MM:SS" (SQLite) or ISO (DynamoDB)
+            if "T" in date_str:
+                dt_utc = datetime.datetime.fromisoformat(date_str)
+            else:
+                dt_utc = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+
+            # Assume stored time is UTC. Convert to local.
+            # a simple way is to use astimezone() on a timezone-aware UTC dt
+            dt_utc = dt_utc.replace(tzinfo=datetime.timezone.utc)
+            dt_local = dt_utc.astimezone()
+            display_date = dt_local.strftime('%Y-%m-%d')
+        except ValueError:
+            # Fallback if parsing fails
+            display_date = date_str.split(' ')[0]
 
         if distinct_range == 0:
             bar_len = max_bar_width // 2
@@ -439,7 +455,7 @@ def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
         previous_price = price
 
         ascii_bar = '#' * bar_len
-        lines.append(f"    {date_short}: {bar_color}{ascii_bar:<30}{Colors.ENDC} ${price:.2f}")
+        lines.append(f"    {display_date}: {bar_color}{ascii_bar:<30}{Colors.ENDC} ${price:.2f}")
 
     # Print Newest -> Oldest
     for line in reversed(lines):
