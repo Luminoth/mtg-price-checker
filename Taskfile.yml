@@ -4,9 +4,9 @@ tasks:
   default:
     desc: Run the price checker with database and card list (Default Behavior)
     cmds:
-      - python3 mtg_price_checker.py --db prices.db --list cards.json
+      - python3 mtg_price_checker.py --database sqlite check --list cards.json
 
-  check:
+  typecheck:
     desc: Run strict type checking
     cmds:
       - mypy mtg_price_checker.py --strict

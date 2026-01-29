@@ -533,51 +533,18 @@ def process_cards(cards: List[CardData], db: Optional[DatabaseInterface],
         # Rate limiting behavior
         time.sleep(0.1)
 
-def main() -> None:
-    """Main execution function."""
-    parser = argparse.ArgumentParser(description="MTG Price Checker")
-    parser.add_argument("--database", choices=["sqlite", "dynamodb"], help="Database backend to use")
-    parser.add_argument("--sqlite-path", help="Path to sqlite database file (default: prices.db)", default="prices.db")
-    parser.add_argument("--list", help="Path to JSON card list file", default=None)
-    parser.add_argument("--remove-card", type=str, metavar="NAME", help="Remove all data for a specific card name and exit")
-    parser.add_argument("--force", action="store_true", help="Force removal without confirmation (requires --remove-card)")
-    parser.add_argument("card_info", nargs="*", help="[Name] [Set] [TargetPrice] [CollectorNum]")
+def handle_remove(args: argparse.Namespace, db: DatabaseInterface) -> None:
+    """Handles the 'remove' subcommand logic."""
+    if not args.force:
+        confirm = input(f"{Colors.YELLOW}Are you sure you want to delete all entries for '{args.name}'? [y/N] {Colors.ENDC}")
+        if confirm.lower() != 'y':
+            print("Operation cancelled.")
+            return
 
-    args = parser.parse_args()
+    db.remove_card(args.name)
 
-    # --- Validate Arguments ---
-    if args.force and not args.remove_card:
-        parser.error("--force can only be used with --remove-card")
-
-    # --- Initialize Database ---
-    db: Optional[DatabaseInterface] = None
-    if args.database == "dynamodb":
-        print("[Mode] DynamoDB")
-        db = DynamoDBBackend(DYNAMODB_TABLE_NAME)
-        db.setup()
-    elif args.database == "sqlite":
-        print(f"[Mode] SQLite ({args.sqlite_path})")
-        db = SQLiteBackend(args.sqlite_path)
-        db.setup()
-
-    # --- Handle Removal ---
-    if args.remove_card:
-        if not db:
-            print(f"{Colors.RED}Error: You must specify a --database to remove a card.{Colors.ENDC}")
-            sys.exit(1)
-
-        if not args.force:
-            confirm = input(f"{Colors.YELLOW}Are you sure you want to delete all entries for '{args.remove_card}'? [y/N] {Colors.ENDC}")
-            if confirm.lower() != 'y':
-                print("Operation cancelled.")
-                db.close()
-                sys.exit(0)
-
-        db.remove_card(args.remove_card)
-        db.close()
-        sys.exit(0)
-
-    # --- Handle Card Data ---
+def handle_check(args: argparse.Namespace, db: DatabaseInterface) -> None:
+    """Handles the 'check' subcommand logic."""
     cards_to_check: List[CardData] = []
 
     # Logic Priority:
@@ -592,19 +559,17 @@ def main() -> None:
         target_price: Optional[float] = None
         collector_number: Optional[str] = None
 
-        if args.database and len(args.card_info) < 3:
-            print(f"{Colors.RED}Error: When using a DB, TargetPrice is required "
-                  f"for single card mode.{Colors.ENDC}")
-            print("Usage: mtg_price_checker.py --database [sqlite|dynamodb] 'Name' 'Set' 'TargetPrice' [CollectorNum]")
-            sys.exit(1)
+        if isinstance(db, (SQLiteBackend, DynamoDBBackend)) and len(args.card_info) < 3:
+             # Basic check to see if we are in DB mode (not purely dry run/no-db mode,
+             # though currently db is always set if we get here, handling implicit "dry run" if we added it back later)
+             pass
 
+        # Validate Target Price if provided
         if len(args.card_info) >= 3:
             try:
                 target_price = float(args.card_info[2])
             except ValueError:
                 print(f"{Colors.RED}Error: TargetPrice must be a number.{Colors.ENDC}")
-                print(f"{Colors.YELLOW}Hint: If your card name has spaces, make sure to "
-                      f"wrap it in quotes (e.g., \"Black Lotus\").{Colors.ENDC}")
                 sys.exit(1)
 
         if len(args.card_info) >= 4:
@@ -619,13 +584,49 @@ def main() -> None:
 
     # 3. No inputs -> Error
     else:
-        parser.print_help()
+        print(f"{Colors.RED}Error: You must provide a list file (--list) or card info arguments.{Colors.ENDC}")
         sys.exit(1)
+
+    process_cards(cards_to_check, db, bool(db))
+
+def main() -> None:
+    """Main execution function."""
+    parser = argparse.ArgumentParser(description="MTG Price Checker")
+    parser.add_argument("--database", choices=["sqlite", "dynamodb"], required=True, help="Database backend to use")
+    parser.add_argument("--sqlite-path", help="Path to sqlite database file (default: prices.db)", default="prices.db")
+
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Command to run")
+
+    # Subparser: Check
+    parser_check = subparsers.add_parser("check", help="Check card prices")
+    parser_check.add_argument("--list", help="Path to JSON card list file", default=None)
+    parser_check.add_argument("card_info", nargs="*", help="[Name] [Set] [TargetPrice] [CollectorNum]")
+
+    # Subparser: Remove
+    parser_remove = subparsers.add_parser("remove", help="Remove a card from the database")
+    parser_remove.add_argument("name", help="Name of the card to remove")
+    parser_remove.add_argument("--force", action="store_true", help="Force removal without confirmation")
+
+    args = parser.parse_args()
+
+    # --- Initialize Database ---
+    db: Optional[DatabaseInterface] = None
+    if args.database == "dynamodb":
+        print("[Mode] DynamoDB")
+        db = DynamoDBBackend(DYNAMODB_TABLE_NAME)
+        db.setup()
+    elif args.database == "sqlite":
+        print(f"[Mode] SQLite ({args.sqlite_path})")
+        db = SQLiteBackend(args.sqlite_path)
+        db.setup()
 
     print(f"{Colors.HEADER}--- MTG Price Fetcher ---{Colors.ENDC}")
     print(f"Timestamp: {datetime.datetime.now()}")
 
-    process_cards(cards_to_check, db, bool(db))
+    if args.command == "check":
+        handle_check(args, db) # type: ignore
+    elif args.command == "remove":
+        handle_remove(args, db) # type: ignore
 
     if db:
         db.close()
