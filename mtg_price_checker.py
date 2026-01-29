@@ -675,5 +675,47 @@ def main() -> None:
 
     print("\nDone.")
 
+
+# --- Lambda Handler ---
+
+def lambda_handler(_event: Any, _context: Any) -> Dict[str, Any]:
+    """
+    AWS Lambda handler function.
+    Triggered by CloudWatch Events (EventBridge).
+    """
+    print(f"Lambda invocation started at {datetime.datetime.now()}")
+
+    # 1. Setup Database (Force DynamoDB for Lambda)
+    if not BOTO3_AVAILABLE:
+        print("Error: boto3 not found in Lambda environment.")
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Error: boto3 missing')
+        }
+
+    database = DynamoDBBackend(DYNAMODB_TABLE_NAME)
+    database.setup()
+
+    # 2. Load Cards
+    # In Lambda, we expect cards.json to be bundled with the function code
+    cards_file = 'cards.json'
+    try:
+        cards = load_cards_from_file(cards_file)
+    except SystemExit:
+        # load_cards_from_file calls sys.exit on failure, which we want to avoid in Lambda
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error: Could not load {cards_file}')
+        }
+
+    # 3. Process
+    print(f"Processing {len(cards)} cards...")
+    process_cards(cards, database, use_db=True)
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps(f'Successfully processed {len(cards)} cards')
+    }
+
 if __name__ == "__main__":
     main()
