@@ -13,14 +13,14 @@ import json
 import sqlite3
 import datetime
 import time
-import os
-from typing import List, Tuple, Optional, Any, TypedDict
-import requests  # type: ignore
+from decimal import Decimal
+from typing import List, Tuple, Optional, Any, TypedDict, Dict
+import requests
 
 # Try to import boto3
 try:
-    import boto3
-    from botocore.exceptions import ClientError
+    import boto3  # type: ignore[import]
+    from botocore.exceptions import ClientError  # type: ignore[import]
     BOTO3_AVAILABLE = True
 except ImportError:
     BOTO3_AVAILABLE = False
@@ -55,22 +55,28 @@ class Colors:
 # --- Database Interface ---
 
 class DatabaseInterface:
+    """Abstract base class for storage backends."""
     def setup(self) -> None:
+        """Prepare the database (create tables, etc)."""
         raise NotImplementedError
 
     def save_price(self, card: CardData, price_usd: float) -> None:
+        """Save a new price entry."""
         raise NotImplementedError
 
     def get_history(self, card: CardData, limit: int = 5) -> List[Tuple[Optional[float], str]]:
+        """Retrieve historical price data."""
         raise NotImplementedError
 
     def remove_card(self, card_name: str) -> None:
+        """Remove all data for a card."""
         raise NotImplementedError
 
     def close(self) -> None:
-        pass
+        """Close any open connections."""
 
 class SQLiteBackend(DatabaseInterface):
+    """SQLite implementation of storage backend."""
     def __init__(self, db_file: str):
         self.db_file = db_file
         self.conn: Optional[sqlite3.Connection] = None
@@ -164,30 +170,37 @@ class SQLiteBackend(DatabaseInterface):
         cursor.execute("DELETE FROM price_history WHERE card_name = ?", (card_name,))
         deleted_count = cursor.rowcount
         self.conn.commit()
-        print(f"{Colors.GREEN}Deleted {deleted_count} entries for card '{card_name}' from SQLite.{Colors.ENDC}")
+        print(f"{Colors.GREEN}Deleted {deleted_count} entries for card '{card_name}' "
+              f"from SQLite.{Colors.ENDC}")
 
     def close(self) -> None:
         if self.conn:
             self.conn.close()
 
 class DynamoDBBackend(DatabaseInterface):
+    """DynamoDB implementation of storage backend."""
     def __init__(self, table_name: str):
         if not BOTO3_AVAILABLE:
-            print(f"{Colors.RED}Error: boto3 is not installed. Please install it to use DynamoDB.{Colors.ENDC}")
+            print(f"{Colors.RED}Error: boto3 is not installed. "
+                  f"Please install it to use DynamoDB.{Colors.ENDC}")
             sys.exit(1)
         self.table_name = table_name
         self.dynamodb = boto3.resource('dynamodb')
         self.table = self.dynamodb.Table(table_name)
 
     def setup(self) -> None:
+        """Checks table accessibility."""
         # We assume table is created via Terraform/external means, but we can check if it exists
         try:
             self.table.load()
-        except ClientError as e:
-            print(f"{Colors.RED}Error accessing DynamoDB table '{self.table_name}': {e}{Colors.ENDC}")
+        except ClientError as err:
+            print(f"{Colors.RED}Error accessing DynamoDB table '{self.table_name}': "
+                  f"{err}{Colors.ENDC}")
             sys.exit(1)
 
-    def _get_card_id(self, card_name: str, set_code: str, collector_number: Optional[str] = None) -> str:
+    @staticmethod
+    def _get_card_id(card_name: str, set_code: str,
+                     collector_number: Optional[str] = None) -> str:
         """Generates a composite key for the card."""
         parts = [card_name, set_code]
         if collector_number:
@@ -204,7 +217,8 @@ class DynamoDBBackend(DatabaseInterface):
             # Check for existing entry today
             response = self.table.query(
                 KeyConditionExpression=boto3.dynamodb.conditions.Key('card_id').eq(card_id) &
-                                       boto3.dynamodb.conditions.Key('fetched_at').begins_with(today_prefix)
+                                       boto3.dynamodb.conditions.Key('fetched_at')
+                                       .begins_with(today_prefix)
             )
 
             if response.get('Items'):
@@ -212,23 +226,20 @@ class DynamoDBBackend(DatabaseInterface):
                 return
 
             # Put Item
-            item = {
+            item: Dict[str, Any] = {
                 'card_id': card_id,
                 'fetched_at': now_iso,
                 'card_name': card['name'],
                 'set_code': card['set'],
-                'price_usd': str(price_usd),
+                'price_usd': Decimal(str(price_usd)),
             }
             if card['collector_number']:
                 item['collector_number'] = card['collector_number']
 
-            from decimal import Decimal
-            item['price_usd'] = Decimal(str(price_usd))
-
             self.table.put_item(Item=item)
 
-        except ClientError as e:
-            print(f"  {Colors.RED}DynamoDB Error saving {card['name']}: {e}{Colors.ENDC}")
+        except ClientError as err:
+            print(f"  {Colors.RED}DynamoDB Error saving {card['name']}: {err}{Colors.ENDC}")
 
     def get_history(self, card: CardData, limit: int = 5) -> List[Tuple[Optional[float], str]]:
         card_id = self._get_card_id(card['name'], card['set'], card['collector_number'])
@@ -249,15 +260,17 @@ class DynamoDBBackend(DatabaseInterface):
 
             return history
 
-        except ClientError as e:
-            print(f"  {Colors.RED}DynamoDB Error fetching history for {card['name']}: {e}{Colors.ENDC}")
+        except ClientError as err:
+            print(f"  {Colors.RED}DynamoDB Error fetching history for {card['name']}: "
+                  f"{err}{Colors.ENDC}")
             return []
 
     def remove_card(self, card_name: str) -> None:
         print(f"Scanning DynamoDB for items with card_name='{card_name}'...")
         try:
-            scan_kwargs: dict = {
-                'FilterExpression': boto3.dynamodb.conditions.Attr('card_name').eq(card_name),
+            scan_kwargs: Dict[str, Any] = {
+                'FilterExpression': boto3.dynamodb.conditions.Attr('card_name')
+                .eq(card_name),
                 'ProjectionExpression': 'card_id, fetched_at'
             }
             done = False
@@ -286,10 +299,11 @@ class DynamoDBBackend(DatabaseInterface):
                             'fetched_at': item['fetched_at']
                         }
                     )
-            print(f"{Colors.GREEN}Successfully deleted {len(items_to_delete)} items from DynamoDB.{Colors.ENDC}")
+            print(f"{Colors.GREEN}Successfully deleted {len(items_to_delete)} items "
+                  f"from DynamoDB.{Colors.ENDC}")
 
-        except ClientError as e:
-            print(f"{Colors.RED}DynamoDB Error deleting {card_name}: {e}{Colors.ENDC}")
+        except ClientError as err:
+            print(f"{Colors.RED}DynamoDB Error deleting {card_name}: {err}{Colors.ENDC}")
 
 # --- API Functions ---
 
@@ -300,7 +314,8 @@ def get_card_price(card: CardData) -> Optional[float]:
     """
     if card['collector_number']:
         # Fetch by Set + Collector Number (Specific Printing)
-        url = f"https://api.scryfall.com/cards/{card['set'].lower()}/{card['collector_number']}"
+        url = f"https://api.scryfall.com/cards/{card['set'].lower()}/" \
+              f"{card['collector_number']}"
         params = {}
     else:
         # Fetch by Name + Set
@@ -333,16 +348,15 @@ def get_card_price(card: CardData) -> Optional[float]:
         print(f"  Warning: No USD price found for {card['name']} ({card['set']})")
         return None
 
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
+    except requests.exceptions.HTTPError as err:
+        if err.response.status_code == 404:
             cn_info = f" #{card['collector_number']}" if card['collector_number'] else ""
             print(f"  Error: Card not found: {card['name']} ({card['set']}{cn_info})")
         else:
-            print(f"  API Error for {card['name']}: {e}")
+            print(f"  API Error for {card['name']}: {err}")
         return None
-    # pylint: disable=broad-exception-caught
-    except Exception as e:
-        print(f"  Unexpected error for {card['name']}: {e}")
+    except Exception as err:  # pylint: disable=broad-except
+        print(f"  Unexpected error for {card['name']}: {err}")
         return None
 
 # --- Recommendation Logic ---
@@ -389,12 +403,29 @@ def generate_recommendation(current_price: Optional[float],
 
 # --- Visualization ---
 
+def _parse_date_to_local(date_str: str) -> str:
+    """Helper to convert UTC date string to local date string."""
+    try:
+        # Handle potential formats: "YYYY-MM-DD HH:MM:SS" (SQLite) or ISO (DynamoDB)
+        if "T" in date_str:
+            dt_utc = datetime.datetime.fromisoformat(date_str)
+        else:
+            dt_utc = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+
+        # Assume stored time is UTC. Convert to local.
+        dt_utc = dt_utc.replace(tzinfo=datetime.timezone.utc)
+        dt_local = dt_utc.astimezone()
+        return dt_local.strftime('%Y-%m-%d')
+    except ValueError:
+        return date_str.split(' ')[0]
+
 def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
     """
     Renders a simple ASCII bar chart for the given history.
     History is expected to be a list of (price, date_str).
     Dates are converted from stored UTC to local time for display.
     """
+    # pylint: disable=too-many-locals
     if not history:
         return
 
@@ -419,22 +450,7 @@ def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
         if price is None:
             continue
 
-        # Convert UTC string to Local Date String
-        try:
-            # Handle potential formats: "YYYY-MM-DD HH:MM:SS" (SQLite) or ISO (DynamoDB)
-            if "T" in date_str:
-                dt_utc = datetime.datetime.fromisoformat(date_str)
-            else:
-                dt_utc = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-
-            # Assume stored time is UTC. Convert to local.
-            # a simple way is to use astimezone() on a timezone-aware UTC dt
-            dt_utc = dt_utc.replace(tzinfo=datetime.timezone.utc)
-            dt_local = dt_utc.astimezone()
-            display_date = dt_local.strftime('%Y-%m-%d')
-        except ValueError:
-            # Fallback if parsing fails
-            display_date = date_str.split(' ')[0]
+        display_date = _parse_date_to_local(date_str)
 
         if distinct_range == 0:
             bar_len = max_bar_width // 2
@@ -466,8 +482,8 @@ def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
 def load_cards_from_file(filepath: str) -> List[CardData]:
     """Loads card list from a JSON file."""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        with open(filepath, 'r', encoding='utf-8') as json_file:
+            data = json.load(json_file)
             # Basic validation
             cards: List[CardData] = []
             for item in data:
@@ -481,21 +497,22 @@ def load_cards_from_file(filepath: str) -> List[CardData]:
     except FileNotFoundError:
         print(f"{Colors.RED}Error: File '{filepath}' not found.{Colors.ENDC}")
         sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"{Colors.RED}Error: Failed to parse '{filepath}': {e}{Colors.ENDC}")
+    except json.JSONDecodeError as err:
+        print(f"{Colors.RED}Error: Failed to parse '{filepath}': {err}{Colors.ENDC}")
         sys.exit(1)
 
-def process_cards(cards: List[CardData], db: Optional[DatabaseInterface],
+def process_cards(cards: List[CardData], database: Optional[DatabaseInterface],
                   use_db: bool) -> None:
     """Iterates through cards and processes them."""
+    # pylint: disable=too-many-branches
     for card in cards:
         cn_str = f" #{card['collector_number']}" if card['collector_number'] else ""
         print(f"\n{Colors.BOLD}Checking: {card['name']} [{card['set']}{cn_str}]...{Colors.ENDC}")
 
         # 1. Get History (if DB)
         history: List[Tuple[Optional[float], str]] = []
-        if db:
-            history = db.get_history(card)
+        if database:
+            history = database.get_history(card)
 
         # 2. Get Current Price
         current_price = get_card_price(card)
@@ -519,8 +536,8 @@ def process_cards(cards: List[CardData], db: Optional[DatabaseInterface],
             rec_color = Colors.RED
 
         # 4. Save to DB
-        if db and current_price is not None:
-            db.save_price(card, current_price)
+        if database and current_price is not None:
+            database.save_price(card, current_price)
 
         # 5. Output
         price_color = Colors.CYAN
@@ -539,8 +556,8 @@ def process_cards(cards: List[CardData], db: Optional[DatabaseInterface],
             print(f"  Recommendation: {rec_color}{recommendation}{Colors.ENDC}")
 
         # Refetch history for graph
-        if db:
-            history = db.get_history(card, limit=14)
+        if database:
+            history = database.get_history(card, limit=14)
             if history:
                 render_ascii_graph(history)
             else:
@@ -549,17 +566,20 @@ def process_cards(cards: List[CardData], db: Optional[DatabaseInterface],
         # Rate limiting behavior
         time.sleep(0.1)
 
-def handle_remove(args: argparse.Namespace, db: DatabaseInterface) -> None:
+def handle_remove(args: argparse.Namespace, database: DatabaseInterface) -> None:
     """Handles the 'remove' subcommand logic."""
     if not args.force:
-        confirm = input(f"{Colors.YELLOW}Are you sure you want to delete all entries for '{args.name}'? [y/N] {Colors.ENDC}")
+        confirm = input(
+            f"{Colors.YELLOW}Are you sure you want to delete all entries for "
+            f"'{args.name}'? [y/N] {Colors.ENDC}"
+        )
         if confirm.lower() != 'y':
             print("Operation cancelled.")
             return
 
-    db.remove_card(args.name)
+    database.remove_card(args.name)
 
-def handle_check(args: argparse.Namespace, db: DatabaseInterface) -> None:
+def handle_check(args: argparse.Namespace, database: DatabaseInterface) -> None:
     """Handles the 'check' subcommand logic."""
     cards_to_check: List[CardData] = []
 
@@ -574,11 +594,6 @@ def handle_check(args: argparse.Namespace, db: DatabaseInterface) -> None:
         set_code = args.card_info[1]
         target_price: Optional[float] = None
         collector_number: Optional[str] = None
-
-        if isinstance(db, (SQLiteBackend, DynamoDBBackend)) and len(args.card_info) < 3:
-             # Basic check to see if we are in DB mode (not purely dry run/no-db mode,
-             # though currently db is always set if we get here, handling implicit "dry run" if we added it back later)
-             pass
 
         # Validate Target Price if provided
         if len(args.card_info) >= 3:
@@ -599,53 +614,65 @@ def handle_check(args: argparse.Namespace, db: DatabaseInterface) -> None:
         }]
 
     # 3. No inputs -> Error
+    # 3. No inputs -> Error
     else:
-        print(f"{Colors.RED}Error: You must provide a list file (--list) or card info arguments.{Colors.ENDC}")
+        print(f"{Colors.RED}Error: You must provide a list file (--list) "
+              f"or card info arguments.{Colors.ENDC}")
         sys.exit(1)
 
-    process_cards(cards_to_check, db, bool(db))
+    process_cards(cards_to_check, database, bool(database))
 
 def main() -> None:
     """Main execution function."""
     parser = argparse.ArgumentParser(description="MTG Price Checker")
-    parser.add_argument("--database", choices=["sqlite", "dynamodb"], required=True, help="Database backend to use")
-    parser.add_argument("--sqlite-path", help="Path to sqlite database file (default: prices.db)", default="prices.db")
+    parser.add_argument("--database", choices=["sqlite", "dynamodb"], required=True,
+                        help="Database backend to use")
+    parser.add_argument("--sqlite-path",
+                        help="Path to sqlite database file (default: prices.db)",
+                        default="prices.db")
 
     subparsers = parser.add_subparsers(dest="command", required=True, help="Command to run")
 
     # Subparser: Check
     parser_check = subparsers.add_parser("check", help="Check card prices")
     parser_check.add_argument("--list", help="Path to JSON card list file", default=None)
-    parser_check.add_argument("card_info", nargs="*", help="[Name] [Set] [TargetPrice] [CollectorNum]")
+    parser_check.add_argument("card_info", nargs="*",
+                              help="[Name] [Set] [TargetPrice] [CollectorNum]")
 
     # Subparser: Remove
-    parser_remove = subparsers.add_parser("remove", help="Remove a card from the database")
+    parser_remove = subparsers.add_parser("remove",
+                                          help="Remove a card from the database")
     parser_remove.add_argument("name", help="Name of the card to remove")
-    parser_remove.add_argument("--force", action="store_true", help="Force removal without confirmation")
+    parser_remove.add_argument("--force", action="store_true",
+                               help="Force removal without confirmation")
 
     args = parser.parse_args()
 
     # --- Initialize Database ---
-    db: Optional[DatabaseInterface] = None
+    database: Optional[DatabaseInterface] = None
     if args.database == "dynamodb":
         print("[Mode] DynamoDB")
-        db = DynamoDBBackend(DYNAMODB_TABLE_NAME)
-        db.setup()
+        database = DynamoDBBackend(DYNAMODB_TABLE_NAME)
+        database.setup()
     elif args.database == "sqlite":
         print(f"[Mode] SQLite ({args.sqlite_path})")
-        db = SQLiteBackend(args.sqlite_path)
-        db.setup()
+        database = SQLiteBackend(args.sqlite_path)
+        database.setup()
 
     print(f"{Colors.HEADER}--- MTG Price Fetcher ---{Colors.ENDC}")
     print(f"Timestamp: {datetime.datetime.now()}")
 
-    if args.command == "check":
-        handle_check(args, db) # type: ignore
-    elif args.command == "remove":
-        handle_remove(args, db) # type: ignore
+    if database:
+        if args.command == "check":
+            handle_check(args, database)
+        elif args.command == "remove":
+            handle_remove(args, database)
+        database.close()
+    else:
+        # Should not happen because database is required and we exit if setup fails
+        # but satisfies mypy if we put logical flow together
+        pass
 
-    if db:
-        db.close()
     print("\nDone.")
 
 if __name__ == "__main__":
