@@ -436,7 +436,7 @@ def render_ascii_graph(history: List[Tuple[Optional[float], str]]) -> None:
     if not prices:
         return
 
-    min_p = min(prices)
+    min_p = 0
     max_p = max(prices)
     distinct_range = max_p - min_p
 
